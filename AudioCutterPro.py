@@ -1,28 +1,3 @@
-import subprocess
-import sys
-
-# === 解决 PyInstaller -w 打包时 ffmpeg 闪黑框的问题 ===
-if sys.platform.startswith('win'):
-    # 定义隐藏窗口的启动信息
-    startupinfo = subprocess.STARTUPINFO()
-    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    startupinfo.wShowWindow = subprocess.SW_HIDE
-
-    # 保存原始的 Popen 类
-    _original_Popen = subprocess.Popen
-
-    # 定义一个新的 Popen 包装类
-    class Popen(_original_Popen):
-        def __init__(self, *args, **kwargs):
-            # 如果调用方没有指定 startupinfo，则强制加上我们定义的隐藏窗口配置
-            if 'startupinfo' not in kwargs:
-                kwargs['startupinfo'] = startupinfo
-            super().__init__(*args, **kwargs)
-
-    # 用我们的包装类替换系统原生的 subprocess.Popen
-    subprocess.Popen = Popen
-# ====================================================
-
 import wx
 import wx.lib.newevent
 import os
@@ -35,21 +10,23 @@ from matplotlib.backends.backend_wxagg import FigureCanvasWxAgg as FigureCanvas
 from pydub import AudioSegment
 import pyaudio
 
+# === 新增：引入 mutagen 用于完美拷贝标签 ===
+from mutagen import File
+from mutagen.id3 import ID3, ID3NoHeaderError
+
 # 设置 matplotlib 不要在独立窗口显示
 matplotlib.use('WXAgg')
 
 import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties, findfont
 
-# --- Matplotlib 中文字体配置 (兼容 WSL/Windows) ---
+# --- Matplotlib 中文字体配置 ---
 try:
-    # 尝试查找系统中的一个中文字体
     font_path = findfont(FontProperties(family=['WenQuanYi Zen Hei', 'Microsoft YaHei', 'SimHei', 'Noto Sans CJK SC']))
     chinese_font = FontProperties(fname=font_path)
     plt.rcParams['font.family'] = chinese_font.get_name()
-    plt.rcParams['axes.unicode_minus'] = False # 解决负号显示问题
+    plt.rcParams['axes.unicode_minus'] = False 
 except Exception:
-    # 降级处理
     plt.rcParams['font.family'] = 'DejaVu Sans'
     plt.rcParams['axes.unicode_minus'] = False
 
@@ -61,7 +38,6 @@ class AudioEditorFrame(wx.Frame):
         super().__init__(None, title="AudioCutter Pro", size=(1300, 850))
         self.SetBackgroundColour(wx.Colour(245, 247, 250))
         
-        # 创建状态栏
         self.CreateStatusBar()
         self.SetStatusText("就绪")
 
@@ -77,25 +53,20 @@ class AudioEditorFrame(wx.Frame):
         self.is_playing_main = False    
         self.stop_play_event = threading.Event() 
         
-        # 播放定时器
         self.playback_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_playback_timer, self.playback_timer)
         self.play_start_time_system = 0 
         self.play_start_cursor = 0      
 
-        # 裁剪标记 (秒)
         self.start_mark = 0.0
         self.end_mark = 0.0
         self.current_cursor_time = 0.0 
-        
         self.cursor_line = None
         
-        # 记忆参数
         self.last_head_trim = 0.0
         self.last_tail_trim = 0.0
         self.has_processed_once = False
 
-        # --- 拖拽/平移 相关状态 ---
         self.is_panning = False
         self.press_x_pixel = 0
         self.initial_xlim = (0, 1)
@@ -107,7 +78,6 @@ class AudioEditorFrame(wx.Frame):
         self.Centre()
 
     def init_ui(self):
-        # 字体定义
         self.font_normal = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL, False, "Microsoft YaHei")
         self.font_bold = wx.Font(10, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD, False, "Microsoft YaHei")
         
@@ -116,22 +86,19 @@ class AudioEditorFrame(wx.Frame):
             lbl.SetFont(self.font_normal)
             return lbl
 
-        # 主布局
         main_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-        # === 左侧侧边栏 ===
+        # === 左侧 ===
         left_panel = wx.Panel(self, size=(260, -1))
         left_panel.SetBackgroundColour(wx.Colour(255, 255, 255))
         left_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # 标题
         title_lbl = wx.StaticText(left_panel, label="AudioCutter Pro")
         title_font = wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD, False, "Microsoft YaHei")
         title_lbl.SetFont(title_font)
         title_lbl.SetForegroundColour(wx.Colour(24, 144, 255)) 
         left_sizer.Add(title_lbl, 0, wx.ALL, 15)
 
-        # 目录按钮
         self.btn_dir = wx.Button(left_panel, label="选择音频目录", size=(-1, 40))
         self.btn_dir.SetBackgroundColour(wx.Colour(24, 144, 255))
         self.btn_dir.SetForegroundColour(wx.WHITE)
@@ -139,7 +106,6 @@ class AudioEditorFrame(wx.Frame):
         self.btn_dir.Bind(wx.EVT_BUTTON, self.on_choose_dir)
         left_sizer.Add(self.btn_dir, 0, wx.EXPAND | wx.ALL, 15)
 
-        # 文件列表
         self.file_list = wx.ListBox(left_panel, style=wx.LB_SINGLE)
         self.file_list.SetFont(self.font_normal)
         self.file_list.Bind(wx.EVT_LISTBOX, self.on_file_selected)
@@ -151,19 +117,16 @@ class AudioEditorFrame(wx.Frame):
         line = wx.StaticLine(self, style=wx.LI_VERTICAL)
         main_sizer.Add(line, 0, wx.EXPAND)
 
-        # === 右侧主区域 ===
+        # === 右侧 ===
         right_panel = wx.Panel(self)
         right_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        # 1. 顶部波形图
         self.wave_panel = wx.Panel(right_panel)
         self.wave_panel.SetBackgroundColour(wx.WHITE)
         wave_sizer = wx.BoxSizer(wx.VERTICAL)
         
         self.figure = Figure(figsize=(5, 4), dpi=100)
         self.figure.patch.set_facecolor('#FFFFFF')
-        
-        # 调整边距，去除空白
         self.figure.subplots_adjust(left=0.01, right=0.99, top=0.99, bottom=0.05)
         
         self.ax = self.figure.add_subplot(111)
@@ -179,11 +142,9 @@ class AudioEditorFrame(wx.Frame):
         self.wave_panel.SetSizer(wave_sizer)
         right_sizer.Add(self.wave_panel, 1, wx.EXPAND | wx.ALL, 5) 
 
-        # 2. 底部控制区域
         bottom_area = wx.Panel(right_panel)
         bottom_sizer = wx.BoxSizer(wx.HORIZONTAL)
 
-        # -- 左下：裁剪范围与播放控制 --
         cut_box = wx.StaticBox(bottom_area, label="裁剪范围 & 预览")
         cut_box.SetFont(self.font_normal)
         cut_sizer = wx.StaticBoxSizer(cut_box, wx.VERTICAL)
@@ -214,20 +175,17 @@ class AudioEditorFrame(wx.Frame):
 
         time_row.Add(start_grp, 1, wx.ALL, 10)
         time_row.Add(end_grp, 1, wx.ALL, 10)
-        
         cut_sizer.Add(time_row, 0, wx.EXPAND)
 
-        # === 播放控制行 (样式统一) ===
         play_row = wx.BoxSizer(wx.HORIZONTAL)
-        
         self.btn_play = wx.Button(bottom_area, label="▶ 播放", size=(100, 35))
-        self.btn_play.SetBackgroundColour(wx.Colour(82, 196, 26)) # Green
+        self.btn_play.SetBackgroundColour(wx.Colour(82, 196, 26))
         self.btn_play.SetForegroundColour(wx.WHITE)
         self.btn_play.SetFont(self.font_normal)
         self.btn_play.Bind(wx.EVT_BUTTON, self.on_btn_play)
         
         self.btn_pause = wx.Button(bottom_area, label="⏸ 暂停", size=(100, 35))
-        self.btn_pause.SetBackgroundColour(wx.Colour(250, 173, 20)) # Orange/Yellow
+        self.btn_pause.SetBackgroundColour(wx.Colour(250, 173, 20))
         self.btn_pause.SetForegroundColour(wx.WHITE)
         self.btn_pause.SetFont(self.font_normal)
         self.btn_pause.Bind(wx.EVT_BUTTON, self.on_btn_pause)
@@ -242,12 +200,10 @@ class AudioEditorFrame(wx.Frame):
         self.lbl_duration.SetForegroundColour(wx.Colour(24, 144, 255))
         cut_sizer.Add(self.lbl_duration, 0, wx.ALIGN_CENTER | wx.TOP, 5)
 
-        # -- 右下：导出参数 --
         export_box = wx.StaticBox(bottom_area, label="导出参数")
         export_box.SetFont(self.font_normal)
         export_sizer = wx.StaticBoxSizer(export_box, wx.VERTICAL)
 
-        # 淡入淡出
         fade_row = wx.BoxSizer(wx.HORIZONTAL)
         fade_row.Add(create_label(bottom_area, "淡入(s):"), 0, wx.ALIGN_CENTER_VERTICAL|wx.RIGHT, 5)
         self.spin_fade_in = wx.SpinCtrlDouble(bottom_area, value="2.0", min=0, max=60, inc=0.5, size=(60,-1))
@@ -257,7 +213,6 @@ class AudioEditorFrame(wx.Frame):
         fade_row.Add(self.spin_fade_out, 1, wx.EXPAND) 
         export_sizer.Add(fade_row, 0, wx.EXPAND | wx.BOTTOM, 10)
 
-        # 音量均衡
         norm_row = wx.BoxSizer(wx.HORIZONTAL)
         self.chk_norm = wx.CheckBox(bottom_area, label="音量均衡 (dB):")
         self.chk_norm.SetFont(self.font_normal)
@@ -267,7 +222,6 @@ class AudioEditorFrame(wx.Frame):
         norm_row.Add(self.txt_db, 0, wx.ALIGN_CENTER_VERTICAL)
         export_sizer.Add(norm_row, 0, wx.EXPAND | wx.BOTTOM, 10)
 
-        # 格式参数
         format_grid = wx.FlexGridSizer(2, 4, 8, 10) 
         format_grid.AddGrowableCol(1, 1)
         format_grid.AddGrowableCol(3, 1)
@@ -290,7 +244,6 @@ class AudioEditorFrame(wx.Frame):
         
         export_sizer.Add(format_grid, 0, wx.EXPAND | wx.BOTTOM, 10)
 
-        # 路径
         path_row = wx.BoxSizer(wx.HORIZONTAL)
         self.txt_save_path = wx.TextCtrl(bottom_area, value="New", style=wx.TE_READONLY)
         self.btn_change_path = wx.Button(bottom_area, label="更改", size=(50, -1))
@@ -301,7 +254,6 @@ class AudioEditorFrame(wx.Frame):
         path_row.Add(self.btn_change_path, 0)
         export_sizer.Add(path_row, 0, wx.EXPAND | wx.BOTTOM, 15)
 
-        # 按钮
         self.btn_process = wx.Button(bottom_area, label="开始处理并保存", size=(-1, 45))
         self.btn_process.SetBackgroundColour(wx.Colour(32, 168, 133))
         self.btn_process.SetForegroundColour(wx.WHITE)
@@ -309,7 +261,6 @@ class AudioEditorFrame(wx.Frame):
         self.btn_process.Bind(wx.EVT_BUTTON, self.on_process)
         export_sizer.Add(self.btn_process, 0, wx.EXPAND)
 
-        # === 布局 ===
         bottom_sizer.Add(cut_sizer, 3, wx.EXPAND | wx.ALL, 10)
         bottom_sizer.Add(export_sizer, 2, wx.EXPAND | wx.ALL, 10)
         bottom_area.SetSizer(bottom_sizer)
@@ -320,7 +271,7 @@ class AudioEditorFrame(wx.Frame):
         main_sizer.Add(right_panel, 1, wx.EXPAND)
         self.SetSizer(main_sizer)
 
-    # --- 目录与文件加载逻辑 ---
+    # --- 逻辑部分 ---
 
     def on_choose_dir(self, event):
         dlg = wx.DirDialog(self, "选择音频目录", style=wx.DD_DEFAULT_STYLE)
@@ -354,6 +305,12 @@ class AudioEditorFrame(wx.Frame):
     def on_file_selected(self, event):
         self.stop_playback_now()
         
+        self.audio_segment = None
+        self.plot_data = None
+        self.ax.clear()
+        self.canvas.draw()
+        self.SetStatusText("正在加载...")
+
         selection = self.file_list.GetStringSelection()
         if not selection: return
         
@@ -364,7 +321,6 @@ class AudioEditorFrame(wx.Frame):
         full_path = os.path.join(self.current_folder, real_filename)
         self.file_path = full_path
         
-        self.SetStatusText(f"正在加载: {real_filename} ...")
         threading.Thread(target=self.load_audio_thread, args=(full_path,)).start()
 
     def load_audio_thread(self, path):
@@ -400,8 +356,6 @@ class AudioEditorFrame(wx.Frame):
         self.draw_waveform(preserve_view=False)
         self.update_time_display()
 
-    # --- 绘图逻辑 ---
-
     def draw_waveform(self, preserve_view=False):
         if self.plot_data is None: return
         
@@ -428,7 +382,7 @@ class AudioEditorFrame(wx.Frame):
 
         self.canvas.draw()
 
-    # --- 播放控制逻辑 ---
+    # --- 播放控制 ---
 
     def stop_playback_now(self):
         self.stop_play_event.set() 
@@ -468,7 +422,7 @@ class AudioEditorFrame(wx.Frame):
                                  channels=chunk_data.channels, rate=chunk_data.frame_rate, output=True)
             
             data = chunk_data.raw_data
-            chunk_size = 256 * 1024 
+            chunk_size = 128 * 1024 
             idx = 0
             
             while idx < len(data) and not self.stop_play_event.is_set():
@@ -518,7 +472,7 @@ class AudioEditorFrame(wx.Frame):
             self.cursor_line.set_xdata([self.current_cursor_time])
             self.canvas.draw_idle() 
 
-    # --- 波形交互 ---
+    # --- 交互 ---
     
     def on_wave_press(self, event):
         if event.inaxes != self.ax: return
@@ -623,8 +577,43 @@ class AudioEditorFrame(wx.Frame):
         secs = duration % 60
         self.lbl_duration.SetLabel(f"选定时长: {mins:02d}:{secs:05.2f}")
 
+    # === 新增：元数据拷贝辅助函数 ===
+    def copy_metadata(self, src_path, dst_path):
+        """ 使用 mutagen 将源文件的所有标签（含封面）克隆到目标文件 """
+        try:
+            # 1. 尝试作为 MP3 处理 (ID3)
+            # 这是最健壮的方法，直接拷贝 ID3 Header
+            try:
+                tags = ID3(src_path)
+                tags.save(dst_path)
+                return # MP3 处理成功，直接返回
+            except ID3NoHeaderError:
+                pass # 不是 MP3 或没有 ID3 标签，继续尝试通用方法
+            except Exception as e:
+                print(f"ID3 copy failed: {e}")
+
+            # 2. 通用文件处理 (FLAC, OGG, M4A 等)
+            src_file = File(src_path)
+            dst_file = File(dst_path)
+            
+            if src_file and dst_file and src_file.tags:
+                if dst_file.tags is None:
+                    dst_file.add_tags()
+                
+                # 简单键值对拷贝
+                for key, value in src_file.tags.items():
+                    dst_file.tags[key] = value
+                
+                dst_file.save()
+                
+        except Exception as e:
+            print(f"Metadata copy error: {e}")
+            # 不抛出异常，避免打断主流程
+
     def on_process(self, event):
-        if not self.audio_segment: return
+        if self.audio_segment is None: 
+            wx.MessageBox("音频正在加载中，请稍候...", "提示")
+            return
         
         self.stop_playback_now()
         
@@ -665,7 +654,11 @@ class AudioEditorFrame(wx.Frame):
         out_path = os.path.join(save_dir, f"{fname}.{fmt}")
         
         try:
+            # 1. 导出音频 (此时不带 Tags，因为 pydub/ffmpeg 对复杂 tag 支持不好)
             seg.export(out_path, format=fmt, bitrate=self.cb_bitrate.GetValue())
+            
+            # 2. === 调用 mutagen 完美拷贝元数据 ===
+            self.copy_metadata(self.file_path, out_path)
             
             self.SetStatusText(f"已保存: {os.path.basename(out_path)}")
             
@@ -690,4 +683,5 @@ if __name__ == '__main__':
     frame = AudioEditorFrame()
     frame.Show()
     app.MainLoop()
+    
     
