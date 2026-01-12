@@ -1,3 +1,28 @@
+import subprocess
+import sys
+
+# === 解决 PyInstaller -w 打包时 ffmpeg 闪黑框的问题 ===
+if sys.platform.startswith('win'):
+    # 定义隐藏窗口的启动信息
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+
+    # 保存原始的 Popen 类
+    _original_Popen = subprocess.Popen
+
+    # 定义一个新的 Popen 包装类
+    class Popen(_original_Popen):
+        def __init__(self, *args, **kwargs):
+            # 如果调用方没有指定 startupinfo，则强制加上我们定义的隐藏窗口配置
+            if 'startupinfo' not in kwargs:
+                kwargs['startupinfo'] = startupinfo
+            super().__init__(*args, **kwargs)
+
+    # 用我们的包装类替换系统原生的 subprocess.Popen
+    subprocess.Popen = Popen
+# ====================================================
+
 import wx
 import wx.lib.newevent
 import os
@@ -52,6 +77,7 @@ class AudioEditorFrame(wx.Frame):
         self.is_playing = False         
         self.is_playing_main = False    
         self.stop_play_event = threading.Event() 
+        self.play_generation_id = 0
         
         self.playback_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_playback_timer, self.playback_timer)
@@ -72,6 +98,9 @@ class AudioEditorFrame(wx.Frame):
         self.initial_xlim = (0, 1)
         
         self.MARKER_DONE = "✅ "
+
+        self.edit_mode = None 
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_key_press)
 
         self.init_ui()
         self.Layout()
@@ -386,6 +415,7 @@ class AudioEditorFrame(wx.Frame):
 
     def stop_playback_now(self):
         self.stop_play_event.set() 
+        self.play_generation_id += 1 # Invalidate previous threads
         if self.playback_timer.IsRunning():
             self.playback_timer.Stop()
         self.is_playing_main = False
@@ -402,8 +432,9 @@ class AudioEditorFrame(wx.Frame):
         self.is_playing_main = True
         self.SetStatusText("正在播放...")
         
+        current_gen = self.play_generation_id
         start_sec = self.current_cursor_time
-        threading.Thread(target=self.play_thread_func, args=(start_sec,)).start()
+        threading.Thread(target=self.play_thread_func, args=(start_sec, current_gen)).start()
         
         self.play_start_time_system = time.time()
         self.play_start_cursor = start_sec
@@ -413,7 +444,7 @@ class AudioEditorFrame(wx.Frame):
         self.stop_playback_now()
         self.SetStatusText("暂停")
 
-    def play_thread_func(self, start_sec):
+    def play_thread_func(self, start_sec, my_gen):
         try:
             start_ms = int(start_sec * 1000)
             chunk_data = self.audio_segment[start_ms:] 
@@ -422,10 +453,13 @@ class AudioEditorFrame(wx.Frame):
                                  channels=chunk_data.channels, rate=chunk_data.frame_rate, output=True)
             
             data = chunk_data.raw_data
-            chunk_size = 128 * 1024 
+            chunk_size = 4096  # Reduced from 128k for better responsiveness
             idx = 0
             
-            while idx < len(data) and not self.stop_play_event.is_set():
+            while idx < len(data):
+                if self.stop_play_event.is_set(): break
+                if self.play_generation_id != my_gen: break # Check generation
+                
                 stream.write(data[idx:idx+chunk_size])
                 idx += chunk_size
                 
@@ -434,7 +468,8 @@ class AudioEditorFrame(wx.Frame):
         except Exception as e:
             print(f"Playback error: {e}")
         finally:
-            if not self.stop_play_event.is_set():
+            # Only trigger finish if we are still the valid generation and wasn't manually stopped
+            if self.play_generation_id == my_gen and not self.stop_play_event.is_set():
                 wx.CallAfter(self.on_playback_finished)
 
     def on_playback_finished(self):
@@ -471,6 +506,79 @@ class AudioEditorFrame(wx.Frame):
         if self.cursor_line:
             self.cursor_line.set_xdata([self.current_cursor_time])
             self.canvas.draw_idle() 
+
+    def on_key_press(self, event):
+        # 忽略文本输入框的快捷键
+        focus_win = wx.Window.FindFocus()
+        if isinstance(focus_win, (wx.TextCtrl, wx.SpinCtrl, wx.SpinCtrlDouble, wx.ComboBox)):
+            event.Skip()
+            return
+
+        code = event.GetKeyCode()
+        
+        # S Key: Mode 'start'
+        if code == ord('S'):
+            self.stop_playback_now()
+            self.edit_mode = 'start'
+            self.current_cursor_time = self.start_mark
+            self.update_cursor_visual()
+            self.on_btn_play(None)
+            
+        # E Key: Mode 'end'
+        elif code == ord('E'):
+            self.stop_playback_now()
+            self.edit_mode = 'end'
+            self.current_cursor_time = self.end_mark
+            self.update_cursor_visual()
+            self.on_btn_play(None)
+            
+        # J Key: Back 100ms
+        elif code == ord('J'):
+            self.stop_playback_now()
+            self.adjust_cursor(-0.1)
+            
+        # K Key: Forward 100ms
+        elif code == ord('K'):
+            self.stop_playback_now()
+            self.adjust_cursor(0.1)
+            
+        else:
+            event.Skip()
+
+    def adjust_cursor(self, delta):
+        new_time = self.current_cursor_time + delta
+        
+        # 边界检查
+        if new_time < 0: new_time = 0
+        if new_time > self.duration_sec: new_time = self.duration_sec
+        
+        self.current_cursor_time = new_time
+        
+        if self.edit_mode == 'start':
+            # 保证 start < end
+            if new_time >= self.end_mark:
+                new_time = self.end_mark - 0.001
+                if new_time < 0: new_time = 0
+                self.current_cursor_time = new_time
+                
+            self.start_mark = new_time
+            self.update_time_display()
+            self.draw_waveform(preserve_view=True)
+            
+        elif self.edit_mode == 'end':
+            # 保证 end > start
+            if new_time <= self.start_mark:
+                new_time = self.start_mark + 0.001
+                if new_time > self.duration_sec: new_time = self.duration_sec
+                self.current_cursor_time = new_time
+                
+            self.end_mark = new_time
+            self.update_time_display()
+            self.draw_waveform(preserve_view=True)
+            
+        else:
+            # 仅移动光标
+            self.update_cursor_visual()
 
     # --- 交互 ---
     
@@ -523,6 +631,7 @@ class AudioEditorFrame(wx.Frame):
             
         self.current_cursor_time = click_time
         self.update_cursor_visual()
+        self.edit_mode = None
 
     def on_wave_scroll(self, event):
         if event.inaxes != self.ax: return
